@@ -2,107 +2,131 @@ package gostream
 
 import (
 	"fmt"
+	"reflect"
 )
-
-var (
-	ErrNotASlice = fmt.Errorf("not a slice")
-)
-
-// change to chan
-type Iterator interface {
-	Elem() interface{}
-	NotNil() bool
-	Next() Iterator
-}
-
-type streamer interface {
-	Iter() Iterator
-}
 
 type Stream struct {
-	base streamer
+	recv func() (interface{}, bool)
 }
 
-func (s Stream) Iter() Iterator {
-	return s.base.Iter()
+var (
+	ErrNotStream = fmt.Errorf("not a stream")
+	dummy        = func() (interface{}, bool) { return nil, false }
+)
+
+func assertSliceOrArray(s interface{}) bool {
+	kind := reflect.TypeOf(s).Kind()
+	return kind == reflect.Slice || kind == reflect.Array
 }
 
-type predicate = func(interface{}) bool
-type mapper = func(interface{}) interface{}
-type sinker = func(interface{})
-
-type filterStream struct {
-	source Stream
-	beg    func() Iterator
+func assertStream(s interface{}) bool {
+	return reflect.TypeOf(s) == reflect.TypeOf(dummy)
 }
 
-func (filterStream) Iter() Iterator {
-	return nil
-}
-
-func (s Stream) Filter(pred predicate) Stream {
-	stream := &filterStream{
-		source: s,
-		beg: func() Iterator {
-			return &filterIter{
-				pred: pred,
+func fromSlice(s interface{}) Stream {
+	var (
+		sliceVal = reflect.ValueOf(s)
+		i        = 0
+		recv     = func() (interface{}, bool) {
+			curr := i
+			if curr >= sliceVal.Len() {
+				return nil, false
 			}
-		},
-	}
-	return Stream{
-		base: stream,
-	}
-}
-
-type filterIter struct {
-	curr, next Iterator
-	pred       predicate
-}
-
-func (iter filterIter) nextElem() (Iterator, bool) {
-	if iter.next != nil {
-		return iter.next, true
-	}
-	for next := iter.curr; next.NotNil(); next = next.Next() {
-		if iter.pred(next.Elem()) {
-			return next, true
+			i++
+			return sliceVal.Index(curr).Interface(), true
 		}
-	}
-	return nil, false
+	)
+	return Stream{recv}
 }
 
-func (iter *filterIter) Elem() interface{} {
-	if !iter.pred(iter.curr.Elem()) {
-		ok := false
-		iter.curr, ok = iter.nextElem()
+func Just(strm interface{}) Stream {
+	switch {
+	case assertSliceOrArray(strm):
+		return fromSlice(strm)
+	case assertStream(strm):
+		return strm.(Stream)
+	} // end of switch
+	panic(ErrNotStream)
+}
+
+func (s Stream) Chan() <-chan interface{} {
+	ch := make(chan interface{})
+	go func(s Stream, ch chan<- interface{}) {
+		defer close(ch)
+		for {
+			s, ok := s.recv()
+			if ok {
+				ch <- s
+			} else {
+				break
+			}
+		}
+	}(s, ch)
+	return ch
+}
+
+func (s Stream) Slice() []interface{} {
+	ret := []interface{}{}
+	for {
+		i, ok := s.recv()
 		if !ok {
-			return nil
+			break
+		} else {
+			ret = append(ret, i)
 		}
 	}
-	return iter.curr.Elem()
+	return ret
 }
 
-func (iter *filterIter) NotNil() bool {
-	return iter.curr != nil && iter.curr.NotNil()
-}
-
-func (iter filterIter) Next() Iterator {
-	if iter.next == nil {
-		iter.next, _ = iter.nextElem()
-	}
-	return &filterIter{
-		curr: iter.next,
-		pred: iter.pred,
+func (s Stream) Sink() {
+	for {
+		_, ok := s.recv()
+		if !ok {
+			return
+		}
 	}
 }
 
-// func (s sliceStream) Map(f func(interface{})) {
-// 	si := s.slice
-// 	if reflect.TypeOf(si).Kind() != reflect.Slice {
-// 		panic(ErrNotASlice)
-// 	}
-// 	slice := reflect.ValueOf(si)
-// 	for i := 0; i < slice.Len(); i++ {
-// 		f(slice.Index(i).Interface())
-// 	}
-// }
+type Consumer = func(interface{})
+
+func (s Stream) ForEach(c Consumer) Stream {
+	recv := func() (interface{}, bool) {
+		i, ok := s.recv()
+		if !ok {
+			return nil, false
+		}
+		c(i)
+		return c, true
+	}
+	return Stream{recv}
+}
+
+type Predicate = func(interface{}) bool
+
+func (s Stream) Filter(pred Predicate) Stream {
+	recv := func() (interface{}, bool) {
+		i, ok := s.recv()
+		if !ok {
+			return nil, false
+		}
+		if pred(i) {
+			return i, true
+		} else {
+			return nil, false
+		}
+	}
+	return Stream{recv}
+}
+
+type Mapper = func(interface{}) interface{}
+
+func (s Stream) Map(m Mapper) Stream {
+	recv := func() (interface{}, bool) {
+		i, ok := s.recv()
+		if !ok {
+			return nil, false
+		}
+		return m(i), true
+	}
+	return Stream{recv}
+}
